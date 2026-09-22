@@ -1,0 +1,117 @@
+name: verify
+
+# Applies the whole migration set to a throwaway PostgreSQL, twice, then runs the
+# repository's own SQL unit tests, the role-leak assertion and PL/pgSQL static
+# analysis. It publishes nothing: no image is built and no registry is touched.
+#
+# The migrations are plain SQL under a naming convention, so the runner here is not
+# the one a deployment has to use. This workflow applies them with Flyway; the
+# deployment pipelines use Evolve. Both read `versions/` as versioned migrations and
+# `code/` as repeatable ones, and both apply every versioned file before any
+# repeatable one, which is what the schema depends on.
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PGDB: verifier
+  PGOWNER: verifier
+  PGPW: verify-ci
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # plpgsql_check is not bundled with the stock PostgreSQL image and the static
+      # analysis below needs it, so the image is built here rather than pulled from
+      # anywhere. It is a two-line Dockerfile on top of the official image.
+      - name: Build a plpgsql_check-capable PostgreSQL
+        run: |
+          docker build -q -t pg-check - <<'EOF'
+          FROM postgres:17
+          RUN apt-get update \
+            && apt-get install -y --no-install-recommends postgresql-17-plpgsql-check \
+            && rm -rf /var/lib/apt/lists/*
+          EOF
+
+      - name: Start a throwaway database
+        run: |
+          docker network create verify-net
+          docker run -d --name verify-pg --network verify-net \
+            -e POSTGRES_USER="$PGOWNER" -e POSTGRES_DB="$PGDB" -e POSTGRES_PASSWORD="$PGPW" \
+            -v "$PWD:/repo:ro" pg-check
+          for i in $(seq 1 60); do
+            docker exec verify-pg pg_isready -U "$PGOWNER" -d "$PGDB" >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker exec verify-pg pg_isready -U "$PGOWNER" -d "$PGDB"
+
+      # The service roles must exist before the migrations run: the migrations grant
+      # privileges to them and fail if a grantee is missing. Passwords here are
+      # throwaway and local to the job; a deployment provisions them from its own
+      # secret store (testing/provision-roles.sh reads them from the environment).
+      - name: Provision the service roles
+        run: |
+          docker exec verify-pg psql -U "$PGOWNER" -d "$PGDB" -v ON_ERROR_STOP=1 -q \
+            -c "CREATE ROLE verifier_core_public LOGIN PASSWORD 'ci'" \
+            -c "CREATE ROLE management_public LOGIN PASSWORD 'ci'" \
+            -c "CREATE ROLE registration_api_public LOGIN PASSWORD 'ci'" \
+            -c "CREATE EXTENSION IF NOT EXISTS plpgsql_check"
+
+      - name: Apply the migrations
+        run: |
+          docker run --rm --network verify-net -v "$PWD:/flyway/sql:ro" flyway/flyway:11-alpine \
+            -url="jdbc:postgresql://verify-pg:5432/$PGDB" -user="$PGOWNER" -password="$PGPW" \
+            -locations=filesystem:/flyway/sql/versions,filesystem:/flyway/sql/code \
+            -connectRetries=10 migrate
+
+      # A second run must change nothing: versioned migrations are already recorded
+      # and the repeatable ones are unchanged, so this is the idempotency proof.
+      - name: Apply them again — must be a no-op
+        run: |
+          docker run --rm --network verify-net -v "$PWD:/flyway/sql:ro" flyway/flyway:11-alpine \
+            -url="jdbc:postgresql://verify-pg:5432/$PGDB" -user="$PGOWNER" -password="$PGPW" \
+            -locations=filesystem:/flyway/sql/versions,filesystem:/flyway/sql/code \
+            -connectRetries=10 migrate
+
+      - name: Assert the schemas exist
+        run: |
+          got=$(docker exec verify-pg psql -U "$PGOWNER" -d "$PGDB" -tAc \
+            "select string_agg(nspname,' ' order by nspname) from pg_namespace \
+             where nspname in ('util','registry','session','audit')")
+          echo "schemas: $got"
+          [ "$got" = "audit registry session util" ] || { echo "::error::expected four schemas, got: $got"; exit 1; }
+
+      - name: SQL unit tests
+        run: |
+          rc=0
+          for t in testing/tests/unit.*.sql; do
+            echo "== $t"
+            docker exec verify-pg psql -U "$PGOWNER" -d "$PGDB" -v ON_ERROR_STOP=1 -f "/repo/$t" || rc=1
+          done
+          exit $rc
+
+      # Asserts that no *_public role can reach anything beyond the procedures it is
+      # granted — the guarantee the EXECUTE-only role model exists for.
+      - name: Role-leak assertion
+        run: docker exec verify-pg psql -U "$PGOWNER" -d "$PGDB" -v ON_ERROR_STOP=1 -f /repo/testing/roleleak.sql
+
+      # check-linter-error-steps.sh reads /tmp/output.txt, so the analysis is written
+      # there and the script decides: any finding at level 'error' fails the job.
+      - name: PL/pgSQL static analysis
+        run: |
+          docker exec verify-pg psql -U "$PGOWNER" -d "$PGDB" -X -x -f /repo/testing/lint-pgSQL.sql > /tmp/output.txt
+          sh testing/check-linter-error-steps.sh
+
+      - name: Stop the database
+        if: always()
+        run: docker rm -f verify-pg >/dev/null 2>&1 || true
