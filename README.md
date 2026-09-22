@@ -4,7 +4,7 @@ The PostgreSQL data layer of the **EUDI wallet verifier** — one database, a sc
 domain, authored as [Evolve](https://evolve-db.netlify.app/) migrations. The SQL is not
 tied to that tool: the files are plain SQL under a naming convention, so any runner that
 applies the versioned files in order and then the repeatable ones applies this set.
-**Evolve and [Flyway](https://flyway.org) both do**, and both are shown below.
+**Evolve and [Flyway](https://https://www.red-gate.com/products/flyway/) both do**, and both are shown below.
 
 The migration set is **database-name and owner-name free** — connection and identity come
 entirely from the environment, so the same files deploy under any database name or owner
